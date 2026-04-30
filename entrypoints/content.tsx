@@ -1,99 +1,124 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ColorPickerOverlay } from '../src/components/ColorPickerOverlay';
+import { Overlay } from '../src/components/Overlay';
 import { useElementInspector } from '../src/hooks/useElementInspector';
+import { useStyleEditor } from '../src/hooks/useStyleEditor';
+import { enabledItem, modsItem } from '../utils/storage';
 
-// Store the absolute original inline styles of elements the very first time they are clicked
-const originalStylesMap = new WeakMap<HTMLElement, any>();
+const applySavedStylesToPage = (mods: any, isEnabled: boolean) => {
+  let styleTag = document.getElementById('ui-modifier-injected-styles');
+
+  if (!isEnabled) {
+    if (styleTag) styleTag.remove();
+    // Also clear any inline styles left by preview on the current page's modified elements
+    const pageKey = window.location.hostname + window.location.pathname;
+    const pageMods = mods[pageKey] || {};
+    for (const [selector, styles] of Object.entries(pageMods)) {
+      try {
+        document.querySelectorAll(selector).forEach(el => {
+          for (const key of Object.keys(styles as any)) {
+            const kebabKey = key.replace(/([A-Z])/g, '-$1').toLowerCase();
+            (el as HTMLElement).style.removeProperty(kebabKey);
+          }
+        });
+      } catch (_) {}
+    }
+    return;
+  }
+
+  if (!styleTag) {
+    styleTag = document.createElement('style');
+    styleTag.id = 'ui-modifier-injected-styles';
+    document.head.appendChild(styleTag);
+  }
+
+  const pageKey = window.location.hostname + window.location.pathname;
+  const pageMods = mods[pageKey] || {};
+  
+  let cssText = '';
+  for (const [selector, styles] of Object.entries(pageMods)) {
+    let rules = '';
+    const s = styles as any;
+    for (const [key, value] of Object.entries(s)) {
+      if (value !== undefined && value !== null) {
+        if (key === 'backgroundImage' && value === 'none') {
+           rules += `background-image: none !important;\n`;
+        } else if (key === 'backgroundImage') {
+           rules += `background-image: ${value} !important;\nbackground-size: cover !important;\nbackground-position: center !important;\n`;
+        } else {
+           const kebabKey = key.replace(/([A-Z])/g, "-$1").toLowerCase();
+           rules += `${kebabKey}: ${value} !important;\n`;
+        }
+      }
+    }
+    if (rules) {
+      cssText += `${selector} {\n${rules}}\n`;
+    }
+    
+    // Apply src changes to IMG tags if any
+    if (s.backgroundImage) {
+      try {
+        document.querySelectorAll(selector).forEach(el => {
+          if (el.tagName === 'IMG') {
+            const urlMatch = s.backgroundImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+            if (urlMatch) {
+              (el as HTMLImageElement).src = urlMatch[1];
+            }
+          }
+        });
+      } catch (_) {}
+    }
+  }
+  
+  styleTag.textContent = cssText;
+};
 
 const App: React.FC = () => {
-  const { element, elementType, currentStyles, position, clearSelection } = useElementInspector(true);
-  const [initialInlineStyles, setInitialInlineStyles] = useState<any>(null);
+  const [isEnabled, setIsEnabled] = useState(true);
 
-  // Store the element's inline styles
+  // Load state on mount + watch for live changes from the popup
   useEffect(() => {
-    if (element) {
-      // 1. Save absolute original styles for the 'Reset' feature (only once per element)
-      if (!originalStylesMap.has(element)) {
-        const styles: any = {};
-        for (const key in currentStyles) {
-          styles[key] = (element.style as any)[key];
-        }
-        originalStylesMap.set(element, styles);
-      }
+    // 1. Initial read
+    Promise.all([enabledItem.getValue(), modsItem.getValue()]).then(([enabled, mods]) => {
+      setIsEnabled(enabled);
+      applySavedStylesToPage(mods, enabled);
+    });
 
-      // 2. Save current state for the 'Cancel' feature (every time it's opened)
-      const styles: any = {};
-      for (const key in currentStyles) {
-        styles[key] = (element.style as any)[key];
-      }
-      setInitialInlineStyles(styles);
-    } else {
-      setInitialInlineStyles(null);
-    }
-  }, [element, currentStyles]);
+    // 2. Watch toggles from popup — fires instantly, no page reload needed
+    const unwatchEnabled = enabledItem.watch((enabled) => {
+      setIsEnabled(enabled);
+      modsItem.getValue().then((mods) => applySavedStylesToPage(mods, enabled));
+    });
 
-  // Live preview handler
-  const handlePreview = (styles: Partial<typeof currentStyles>) => {
-    if (element) {
-      Object.entries(styles).forEach(([key, value]) => {
-        if (value !== undefined) {
-          (element.style as any)[key] = value;
-        }
-      });
-    }
-  };
+    // 3. Watch style modifications
+    const unwatchMods = modsItem.watch((mods) => {
+      enabledItem.getValue().then((enabled) => applySavedStylesToPage(mods ?? {}, enabled));
+    });
 
-  const handleApply = () => {
-    // Styles are already applied in preview. Just clear selection to close the picker.
-    clearSelection();
-  };
+    return () => {
+      unwatchEnabled();
+      unwatchMods();
+    };
+  }, []);
 
-  const handleCancel = () => {
-    // Revert to initial inline styles before the picker was opened
-    if (element && initialInlineStyles) {
-      Object.entries(initialInlineStyles).forEach(([key, value]) => {
-        (element.style as any)[key] = value;
-      });
-    }
-    clearSelection();
-  };
 
-  const handleReset = () => {
-    // Revert to the absolute original styles the element had when the page loaded
-    if (element && originalStylesMap.has(element)) {
-      const original = originalStylesMap.get(element);
-      Object.entries(original).forEach(([key, value]) => {
-        (element.style as any)[key] = value;
-      });
-      
-      // Compute the fresh styles to send back to the UI
-      const computed = window.getComputedStyle(element);
-      const restoredStyles: any = {};
-      for (const key in currentStyles) {
-        if (key === 'padding') {
-          restoredStyles[key] = computed.padding || `${computed.paddingTop} ${computed.paddingRight} ${computed.paddingBottom} ${computed.paddingLeft}`;
-        } else {
-          restoredStyles[key] = (computed as any)[key];
-        }
-      }
-      return restoredStyles;
-    }
-    return null;
-  };
+  const { element, elementType, currentStyles, position, clearSelection, hasImage, selector } = useElementInspector(isEnabled);
+  const { handlePreview, handleApply, handleCancel, handleReset, handleHide } = useStyleEditor({ element, currentStyles, selector, clearSelection });
 
   return (
     <>
       {element && (
-        <ColorPickerOverlay
+        <Overlay
           element={element}
           elementType={elementType}
+          hasImage={hasImage}
           currentStyles={currentStyles}
           position={position}
           onChange={handlePreview}
           onApply={handleApply}
           onCancel={handleCancel}
           onReset={handleReset}
+          onHide={handleHide}
         />
       )}
     </>
